@@ -16,6 +16,7 @@ By connecting this server to ChatGPT, you instantly give it the ability to act a
 - **`get_week_summary`**: Summarize a full Monday-Sunday week of training load.
 - **`get_daily_recovery`**: Read your sleep stages, HRV, body battery, and resting heart rate to determine training readiness.
 - **`get_weight_trend`**: Check recent body weight weigh-ins securely.
+- **`get_heart_rate_zones`**: Returns your heart rate zone boundaries (Zone 1-5 in bpm) per sport, max HR, lactate threshold, VO2 max, and training method. Essential for properly classifying effort levels in activity analysis.
 
 ### Hevy (Strength Training) Integration
 - **`get_lifting_sessions`**: Pull recent or historical (via date range) strength training logs. Includes sets, reps, weight, RPE, and set types (warmup, dropset, failure).
@@ -40,6 +41,8 @@ Once connected, you can ask ChatGPT things like:
 > *"Pull my Garmin week summary and my Hevy lifting volume for the past 7 days. Am I overtraining?"*
 
 > *"Compare my Garmin Coach planned interval run from yesterday to the actual activity detail. Did I hit my target paces on the sprints?"*
+
+> *"Pull my heart rate zones and then analyze my last 5 runs. Was I spending too much time in Zone 4/5 on my easy runs?"*
 
 ---
 
@@ -67,11 +70,13 @@ Clone this repository and push it to your own personal GitHub account.
 4. Click **Deploy**. Vercel will build and host your server.
 
 ### Step 3: Add Vercel Blob (Crucial for Garmin)
-Garmin requires a session token to avoid blocking you for logging in too often. We use Vercel Blob to store this session securely.
+Garmin requires a session token to avoid blocking you for logging in too often. We use Vercel Blob (with **private** access) to store this session securely.
 1. In your Vercel Dashboard for the project, go to the **Storage** tab.
 2. Click **Create Database** and select **Vercel Blob**.
 3. Follow the prompts to attach it to your deployed project. Vercel will automatically add the `BLOB_READ_WRITE_TOKEN` to your environment variables.
 4. Go to the **Deployments** tab and click **Redeploy** on your latest build so it picks up the new Blob token.
+
+> **Note**: The server uses the `@vercel/blob` SDK's `get()` and `put()` methods with `access: "private"` — make sure your Blob store is configured as a **private** store (this is the default).
 
 ---
 
