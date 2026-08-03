@@ -2,8 +2,21 @@ import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { getGarminClient } from "@/lib/garmin/client";
 import { GARMIN_ENDPOINTS } from "@/lib/garmin/endpoints";
-import { ActivityType } from "@flow-js/garmin-connect";
+import {
+    ActivityType,
+    WorkoutBuilder,
+    WorkoutType,
+    Step,
+    StepType,
+    TimeDuration,
+    DistanceDuration,
+    NoDuration,
+    PaceTarget,
+    HrmTarget,
+    NoTarget,
+} from "@flow-js/garmin-connect";
 import { getHevyClient } from "@/lib/hevy/client";
+import { readGoals, writeGoals, Race } from "@/lib/goals/client";
 
 export const runtime = "nodejs";
 
@@ -569,6 +582,107 @@ const TOOLS: Record<string, { description: string; handler: (args: any) => Promi
             };
         },
     },
+
+    // ─── Goals & Race Calendar ─────────────────────────────
+
+    get_goals: {
+        description: "Returns the athlete's race calendar and constraints (sports focus, weekly availability, injuries/constraints, and all races with date/priority/status/targetNote). This NEVER contains performance numbers (times, paces) - those must always be looked up fresh from Garmin activity history, never trusted from memory.",
+        handler: async () => {
+            return await readGoals();
+        },
+    },
+
+    set_athlete_info: {
+        description: "Updates the athlete's general training context: which sports they train (e.g. running, triathlon), how many days per week they can realistically train, and any active constraints (injuries, access limitations, etc). Only provided fields are changed; omit a field to leave it unchanged.",
+        handler: async ({ sportsFocus, weeklyAvailabilityDays, constraints }) => {
+            const goals = await readGoals();
+            if (sportsFocus !== undefined) goals.athlete.sportsFocus = sportsFocus;
+            if (weeklyAvailabilityDays !== undefined) goals.athlete.weeklyAvailabilityDays = weeklyAvailabilityDays;
+            if (constraints !== undefined) goals.athlete.constraints = constraints;
+            await writeGoals(goals);
+            return goals;
+        },
+    },
+
+    add_or_update_race: {
+        description: "Adds a new race to the calendar, or updates an existing one if the id already exists. discipline must be one of: run_5k, run_10k, half_marathon, marathon, triathlon_sprint, triathlon_olympic, triathlon_70.3, triathlon_full, other. priority A = main goal race, B = important tune-up race, C = training/tune-up race. targetNote should be a QUALITATIVE goal in words (e.g. 'Beat this year's finish time by at least 1 hour') - never hardcode a specific time here from memory; actual current times should always be looked up from Garmin activity history when reasoning about progress.",
+        handler: async ({ id, name, discipline, date, priority, status, targetNote }) => {
+            const goals = await readGoals();
+            const existingIndex = goals.races.findIndex((r) => r.id === id);
+            const race: Race = { id, name, discipline, date, priority, status, targetNote: targetNote || "" };
+            if (existingIndex >= 0) {
+                goals.races[existingIndex] = { ...goals.races[existingIndex], ...race };
+            } else {
+                goals.races.push(race);
+            }
+            goals.races.sort((a, b) => a.date.localeCompare(b.date));
+            await writeGoals(goals);
+            return goals;
+        },
+    },
+
+    remove_race: {
+        description: "Removes a race from the calendar by its id.",
+        handler: async ({ id }) => {
+            const goals = await readGoals();
+            goals.races = goals.races.filter((r) => r.id !== id);
+            await writeGoals(goals);
+            return goals;
+        },
+    },
+
+    // ─── Push structured workout to Garmin ─────────────────
+
+    create_and_schedule_workout: {
+        description: "Builds a structured workout (warmup, main steps with pace/HR targets, cooldown, etc) and schedules it on the Garmin calendar for a given date. It syncs to the user's watch automatically - no manual transcription needed. sport must be one of: running, cycling, swimming, strength, cardio. Each step: stepType is one of warmup|main|recovery|rest|cooldown|other. durationType is 'time' (durationValue in seconds), 'distance' (durationValue in meters), or 'open' (lap-press / no fixed end, durationValue ignored). target is optional: {type:'pace', paceMinPerKm: number, marginSeconds?: number} or {type:'hr', bpm: number, margin?: number} or omit for no target. For intervals (e.g. '6x1km hard + 2min easy'), just repeat the main+recovery step pairs 6 times in the steps array - do not try to nest a repeat group.",
+        handler: async ({ sport, name, date, steps }) => {
+            const sportMap: Record<string, any> = {
+                running: WorkoutType.Running,
+                cycling: WorkoutType.Cycling,
+                swimming: WorkoutType.Swimming,
+                strength: WorkoutType.Strength,
+                cardio: WorkoutType.Cardio,
+            };
+            const stepTypeMap: Record<string, any> = {
+                warmup: StepType.WarmUp,
+                main: StepType.Run,
+                recovery: StepType.Recovery,
+                rest: StepType.Rest,
+                cooldown: StepType.Cooldown,
+                other: StepType.Other,
+            };
+
+            const builder = new WorkoutBuilder(sportMap[sport] || WorkoutType.Running, name);
+
+            for (const s of steps) {
+                let duration;
+                if (s.durationType === "time") duration = TimeDuration.fromSeconds(s.durationValue);
+                else if (s.durationType === "distance") duration = DistanceDuration.fromMeters(s.durationValue);
+                else duration = new NoDuration();
+
+                let target;
+                if (s.target?.type === "pace") {
+                    const mins = Math.floor(s.target.paceMinPerKm);
+                    const secs = Math.round((s.target.paceMinPerKm - mins) * 60);
+                    target = PaceTarget.pace(mins, secs, s.target.marginSeconds ?? 5);
+                } else if (s.target?.type === "hr") {
+                    target = HrmTarget.hrm(s.target.bpm, s.target.margin ?? 5);
+                } else {
+                    target = new NoTarget();
+                }
+
+                builder.addStep(new Step(stepTypeMap[s.stepType] || StepType.Other, duration, target, s.notes));
+            }
+
+            const workoutDetail = builder.build();
+            const client = await getGarminClient();
+            const created = await client.createWorkout(workoutDetail);
+            const workoutId = (created as any).workoutId;
+            await client.scheduleWorkout({ workoutId: String(workoutId) }, date);
+
+            return { workoutId, name, sport, date, scheduled: true };
+        },
+    },
 };
 
 // ─── MCP Protocol Handlers ────────────────────────────────
@@ -747,6 +861,91 @@ async function handleRequest(body: any) {
                     properties: {
                         sessions: { type: "number", description: "Number of recent sessions to analyze (1-30, default 5)" }
                     },
+                    additionalProperties: true
+                }
+            },
+            {
+                name: "get_goals",
+                description: "Returns the athlete's race calendar and training constraints. Never contains performance numbers - always cross-check current fitness/times against real Garmin activity history.",
+                annotations: readOnlyAnnotations,
+                inputSchema: { type: "object", properties: {}, additionalProperties: true }
+            },
+            {
+                name: "set_athlete_info",
+                description: "Updates general training context: sports focus, weekly training days available, active constraints/injuries. Omit fields to leave them unchanged.",
+                annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        sportsFocus: { type: "array", items: { type: "string" }, description: "e.g. ['running','triathlon']" },
+                        weeklyAvailabilityDays: { type: "number", description: "Realistic training days per week" },
+                        constraints: { type: "array", items: { type: "string" }, description: "Free text constraints, e.g. injuries or access limitations" }
+                    },
+                    additionalProperties: true
+                }
+            },
+            {
+                name: "add_or_update_race",
+                description: "Adds or updates a race in the calendar (upsert by id). targetNote must be qualitative (e.g. 'beat this year's time by 1 hour'), never a hardcoded number from memory.",
+                annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        id: { type: "string", description: "Stable short id, e.g. 'roma-marathon-2026'" },
+                        name: { type: "string" },
+                        discipline: { type: "string", description: "run_5k|run_10k|half_marathon|marathon|triathlon_sprint|triathlon_olympic|triathlon_70.3|triathlon_full|other" },
+                        date: { type: "string", description: "YYYY-MM-DD (approximate is fine, e.g. 2026-03-15)" },
+                        priority: { type: "string", description: "A (main goal), B (tune-up), or C (training race)" },
+                        status: { type: "string", description: "upcoming or completed" },
+                        targetNote: { type: "string", description: "Qualitative goal in words, not a hardcoded number" }
+                    },
+                    required: ["id", "name", "discipline", "date", "priority", "status"],
+                    additionalProperties: true
+                }
+            },
+            {
+                name: "remove_race",
+                description: "Removes a race from the calendar by id.",
+                annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
+                inputSchema: {
+                    type: "object",
+                    properties: { id: { type: "string" } },
+                    required: ["id"],
+                    additionalProperties: true
+                }
+            },
+            {
+                name: "create_and_schedule_workout",
+                description: "Builds a structured workout and schedules it on the Garmin calendar for a given date - it syncs to the watch automatically. sport: running|cycling|swimming|strength|cardio. For intervals, repeat main+recovery step pairs in the array rather than nesting a repeat group.",
+                annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        sport: { type: "string", description: "running|cycling|swimming|strength|cardio" },
+                        name: { type: "string", description: "Workout name, e.g. 'Threshold 6x1km'" },
+                        date: { type: "string", description: "YYYY-MM-DD date to schedule it on" },
+                        steps: {
+                            type: "array",
+                            description: "Ordered list of workout steps",
+                            items: {
+                                type: "object",
+                                properties: {
+                                    stepType: { type: "string", description: "warmup|main|recovery|rest|cooldown|other" },
+                                    durationType: { type: "string", description: "time|distance|open" },
+                                    durationValue: { type: "number", description: "seconds if time, meters if distance" },
+                                    target: {
+                                        type: "object",
+                                        description: "Optional. {type:'pace', paceMinPerKm, marginSeconds?} or {type:'hr', bpm, margin?}. Omit for no target.",
+                                        additionalProperties: true
+                                    },
+                                    notes: { type: "string" }
+                                },
+                                required: ["stepType", "durationType"],
+                                additionalProperties: true
+                            }
+                        }
+                    },
+                    required: ["sport", "name", "date", "steps"],
                     additionalProperties: true
                 }
             }
