@@ -36,7 +36,7 @@ const DEFAULT_GOALS: AthleteGoals = {
 export async function readGoals(): Promise<AthleteGoals> {
     try {
         if (isProduction) {
-            const result = await get(GOALS_BLOB_NAME, { access: "private" });
+            const result = await get(GOALS_BLOB_NAME, { access: "private", useCache: false });
             if (!result || result.statusCode !== 200 || !result.stream) return DEFAULT_GOALS;
             const reader = result.stream.getReader();
             const chunks: Uint8Array[] = [];
