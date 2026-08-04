@@ -63,6 +63,7 @@ export async function writeGoals(goals: AthleteGoals): Promise<void> {
         await put(GOALS_BLOB_NAME, data, {
             access: "private",
             addRandomSuffix: false,
+            allowOverwrite: true,
             contentType: "application/json",
         });
     } else {
